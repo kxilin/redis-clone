@@ -2,21 +2,44 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include "utils.h"
 
 // one read and write
-void do_something(int connfd) {
-  char rbuf[64] = {};
-  ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-  if (n < 0) {
-    msg("read() error");
-    return;
+static int32_t one_request(int connfd) {
+  // get the message length
+  char rbuf[k_header_size + k_max_msg];
+  errno = 0;
+  int32_t err = read_all(connfd, rbuf, k_header_size);
+  if (err) {
+    msg(errno == 0 ? "EOF" : "read() error");
+    return err;
   }
-  printf("client says: %s\n", rbuf);
 
-  char wbuf[] = "world";
-  write(connfd, wbuf, strlen(wbuf));
+  uint32_t len = 0;
+  memcpy(&len, rbuf, k_header_size); // assumes client and server same endianness
+  if (len > k_max_msg) {
+    msg("too long");
+    return -1;
+  }
+
+  // get actual request
+  err = read_all(connfd, rbuf + k_header_size, len);
+  if (err) {
+    msg(errno == 0 ? "EOF" : "read() error");
+    return err;
+  }
+
+  // respond to request
+  printf("client says: %.*s\n", len, rbuf + k_header_size);
+  const char reply[] = "world";
+  char wbuf[k_header_size + sizeof(reply)]; // wastes the last byte but at least no VLA
+  len = (uint32_t)strlen(reply);
+  memcpy(wbuf, &len, k_header_size);
+  memcpy(wbuf + k_header_size, reply, len);
+
+  return write_all(connfd, wbuf, k_header_size + len);
 }
 
 int main() {
@@ -46,7 +69,12 @@ int main() {
     int connfd = accept(fd, (struct sockaddr*)&client_addr, &addrlen);
     if (connfd < 0) continue; // error with connection, ignore
 
-    do_something(connfd); // process the client
+    while (true) { // handle more than one request from a client
+      int32_t err = one_request(connfd);
+      if (err) break;
+    }
     close(connfd);
   }
+
+  return 0;
 }
