@@ -1,95 +1,209 @@
+#include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
-#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
-#include "utils.h"
+static void msg(const char* msg) { fprintf(stderr, "%s\n", msg); }
 
-static int32_t send_req(int fd, std::vector<std::string>& cmd) {
+static void die(const char* msg) {
+  int err = errno;
+  fprintf(stderr, "[%d] %s\n", err, msg);
+  abort();
+}
+
+static int32_t read_full(int fd, char* buf, size_t n) {
+  while (n > 0) {
+    ssize_t rv = read(fd, buf, n);
+    if (rv <= 0) {
+      return -1;  // error, or unexpected EOF
+    }
+    assert((size_t)rv <= n);
+    n -= (size_t)rv;
+    buf += rv;
+  }
+  return 0;
+}
+
+static int32_t write_all(int fd, const char* buf, size_t n) {
+  while (n > 0) {
+    ssize_t rv = write(fd, buf, n);
+    if (rv <= 0) {
+      return -1;  // error
+    }
+    assert((size_t)rv <= n);
+    n -= (size_t)rv;
+    buf += rv;
+  }
+  return 0;
+}
+
+const size_t k_max_msg = 4096;
+
+static int32_t send_req(int fd, const std::vector<std::string>& cmd) {
   uint32_t len = 4;
   for (const std::string& s : cmd) {
     len += 4 + s.size();
   }
-
   if (len > k_max_msg) {
-    msg("too long");
     return -1;
   }
 
-  struct Buffer wbuf;
-  buf_init(&wbuf, 16 * 1024);
-
-  buf_append(&wbuf, (const uint8_t*)&len, k_header_size);
-
+  char wbuf[4 + k_max_msg];
+  memcpy(&wbuf[0], &len, 4);  // assume little endian
   uint32_t n = (uint32_t)cmd.size();
-  buf_append(&wbuf, (const uint8_t*)&n, k_header_size);
-
+  memcpy(&wbuf[4], &n, 4);
+  size_t cur = 8;
   for (const std::string& s : cmd) {
     uint32_t p = (uint32_t)s.size();
-    buf_append(&wbuf, (const uint8_t*)&p, k_header_size);
-    buf_append(&wbuf, (const uint8_t*)s.data(), s.size());
+    memcpy(&wbuf[cur], &p, 4);
+    memcpy(&wbuf[cur + 4], s.data(), s.size());
+    cur += 4 + s.size();
   }
+  return write_all(fd, wbuf, 4 + len);
+}
 
-  // Accessing the pointer directly via data_begin
-  int32_t err = write_all(fd, wbuf.data_begin, buf_size(&wbuf));
+enum {
+  TAG_NIL = 0,  // nil
+  TAG_ERR = 1,  // error code + msg
+  TAG_STR = 2,  // string
+  TAG_INT = 3,  // int64
+  TAG_DBL = 4,  // double
+  TAG_ARR = 5,  // array
+};
 
-  buf_destroy(&wbuf);
-  return err;
+static int32_t print_response(const uint8_t* data, size_t size) {
+  if (size < 1) {
+    msg("bad response");
+    return -1;
+  }
+  switch (data[0]) {
+    case TAG_NIL:
+      printf("(nil)\n");
+      return 1;
+    case TAG_ERR:
+      if (size < 1 + 8) {
+        msg("bad response");
+        return -1;
+      }
+      {
+        int32_t code = 0;
+        uint32_t len = 0;
+        memcpy(&code, &data[1], 4);
+        memcpy(&len, &data[1 + 4], 4);
+        if (size < 1 + 8 + len) {
+          msg("bad response");
+          return -1;
+        }
+        printf("(err) %d %.*s\n", code, len, &data[1 + 8]);
+        return 1 + 8 + len;
+      }
+    case TAG_STR:
+      if (size < 1 + 4) {
+        msg("bad response");
+        return -1;
+      }
+      {
+        uint32_t len = 0;
+        memcpy(&len, &data[1], 4);
+        if (size < 1 + 4 + len) {
+          msg("bad response");
+          return -1;
+        }
+        printf("(str) %.*s\n", len, &data[1 + 4]);
+        return 1 + 4 + len;
+      }
+    case TAG_INT:
+      if (size < 1 + 8) {
+        msg("bad response");
+        return -1;
+      }
+      {
+        int64_t val = 0;
+        memcpy(&val, &data[1], 8);
+        printf("(int) %ld\n", val);
+        return 1 + 8;
+      }
+    case TAG_DBL:
+      if (size < 1 + 8) {
+        msg("bad response");
+        return -1;
+      }
+      {
+        double val = 0;
+        memcpy(&val, &data[1], 8);
+        printf("(dbl) %g\n", val);
+        return 1 + 8;
+      }
+    case TAG_ARR:
+      if (size < 1 + 4) {
+        msg("bad response");
+        return -1;
+      }
+      {
+        uint32_t len = 0;
+        memcpy(&len, &data[1], 4);
+        printf("(arr) len=%u\n", len);
+        size_t arr_bytes = 1 + 4;
+        for (uint32_t i = 0; i < len; ++i) {
+          int32_t rv = print_response(&data[arr_bytes], size - arr_bytes);
+          if (rv < 0) {
+            return rv;
+          }
+          arr_bytes += (size_t)rv;
+        }
+        printf("(arr) end\n");
+        return (int32_t)arr_bytes;
+      }
+    default:
+      msg("bad response");
+      return -1;
+  }
 }
 
 static int32_t read_res(int fd) {
-  // Protocol message header
-  uint8_t header[k_header_size];
+  // 4 bytes header
+  char rbuf[4 + k_max_msg];
   errno = 0;
-  int32_t err = read_all(fd, header, k_header_size);
+  int32_t err = read_full(fd, rbuf, 4);
   if (err) {
-    msg(errno == 0 ? "EOF" : "read() error");
+    if (errno == 0) {
+      msg("EOF");
+    } else {
+      msg("read() error");
+    }
     return err;
   }
 
   uint32_t len = 0;
-  memcpy(&len, header, k_header_size);
+  memcpy(&len, rbuf, 4);  // assume little endian
   if (len > k_max_msg) {
     msg("too long");
     return -1;
   }
 
-  // Protocol message body
-  struct Buffer rbuf;
-  buf_init(&rbuf, len);
-
-  // Read the body into the buffer
-  // Note: read_all expects a raw pointer, so we pass rbuf.data_begin
-  err = read_all(fd, rbuf.data_begin, len);
+  // reply body
+  err = read_full(fd, &rbuf[4], len);
   if (err) {
     msg("read() error");
-    buf_destroy(&rbuf);
     return err;
   }
 
-  // Update the buffer's end pointer since we filled it manually via read_all
-  rbuf.data_end = rbuf.data_begin + len;
-
-  // Print the result
-  if (len < 4) {
+  // print the result
+  int32_t rv = print_response((uint8_t*)&rbuf[4], len);
+  if (rv > 0 && (uint32_t)rv != len) {
     msg("bad response");
-    buf_destroy(&rbuf);
-    return -1;
+    rv = -1;
   }
-
-  uint32_t rescode = 0;
-  memcpy(&rescode, rbuf.data_begin, 4);
-  printf("server says: [%u] %.*s\n", rescode, (int)(len - 4),
-         rbuf.data_begin + 4);
-
-  buf_destroy(&rbuf);
-  return 0;
+  return rv;
 }
 
 int main() {
@@ -101,32 +215,38 @@ int main() {
   addr.sin_port = htons(1234);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-  if (connect(fd, (const struct sockaddr*)&addr, sizeof(addr)) < 0) {
-    die("connect()");
+  if (connect(fd, (const struct sockaddr*)&addr, sizeof(addr))) {
+    die("connect");
   }
 
-  std::vector<std::vector<std::string>> pipeline = {
-      {"set", "k1", "v1"}, {"get", "k1"}, {"set", "k2", "v2"},
-      {"get", "k2"},       {"del", "k1"}, {"get", "k1"}};
+  // --- PIPELINING TEST START ---
+  printf("--- Sending pipelined requests ---\n");
 
-  printf("Sending %zu pipelined requests...\n", pipeline.size());
-  for (auto& cmd : pipeline) {
+  // 1. Prepare multiple commands
+  std::vector<std::vector<std::string>> pipeline = {{"set", "key1", "hello"},
+                                                    {"set", "key2", "world"},
+                                                    {"get", "key1"},
+                                                    {"get", "key2"},
+                                                    {"keys"}};
+
+  // 2. Send ALL requests without reading responses yet
+  for (const auto& cmd : pipeline) {
+    printf("Sending: %s...\n", cmd[0].c_str());
     if (send_req(fd, cmd) != 0) {
-      msg("send_req error");
-      goto L_DONE;
+      die("send_req");
     }
   }
 
-  printf("Reading responses back...\n");
-  for (size_t i = 0; i < pipeline.size(); i++) {
+  printf("\n--- All requests sent, now reading responses ---\n");
+
+  // 3. Read back all responses in order
+  for (size_t i = 0; i < pipeline.size(); ++i) {
     printf("Response %zu: ", i + 1);
-    if (read_res(fd) != 0) {
-      msg("read_res error");
-      goto L_DONE;
+    if (read_res(fd) < 0) {
+      break;
     }
   }
 
-L_DONE:
   close(fd);
   return 0;
 }

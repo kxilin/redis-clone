@@ -54,10 +54,10 @@ static Conn* handle_accept(int fd) {
   Conn* conn = new Conn();
   conn->fd = connfd;
   conn->want_read = true;  // read the first request
-  
+
   buf_init(&conn->incoming, 16 * 1024);
   buf_init(&conn->outgoing, 16 * 1024);
-  
+
   return conn;
 }
 
@@ -114,6 +114,62 @@ static int32_t parse_req(const uint8_t* data, size_t size,
   return 0;
 }
 
+// error code for TAG_ERR
+enum {
+  ERR_UNKNOWN = 1,  // unknown command
+  ERR_TOO_BIG = 2,  // response too big
+};
+
+// data types of serialized data
+enum {
+  TAG_NIL = 0,  // nil
+  TAG_ERR = 1,  // error code + msg
+  TAG_STR = 2,  // string
+  TAG_INT = 3,  // int64
+  TAG_DBL = 4,  // double
+  TAG_ARR = 5,  // array
+};
+
+// serialization helper functions
+static void buf_append_u8(Buffer* buf, uint8_t data) {
+  buf_append(buf, (const uint8_t*)&data, 1);
+}
+static void buf_append_u32(Buffer* buf, uint32_t data) {
+  buf_append(buf, (const uint8_t*)&data, 4);
+}
+static void buf_append_i64(Buffer* buf, int64_t data) {
+  buf_append(buf, (const uint8_t*)&data, 8);
+}
+static void buf_append_dbl(Buffer* buf, double data) {
+  buf_append(buf, (const uint8_t*)&data, 8);
+}
+
+// append serialized data types to the back
+static void out_nil(Buffer* out) { buf_append_u8(out, TAG_NIL); }
+static void out_str(Buffer* out, const char* s, size_t size) {
+  buf_append_u8(out, TAG_STR);
+  buf_append_u32(out, (uint32_t)size);
+  buf_append(out, (const uint8_t*)s, size);
+}
+static void out_int(Buffer* out, int64_t val) {
+  buf_append_u8(out, TAG_INT);
+  buf_append_i64(out, val);
+}
+static void out_dbl(Buffer* out, double val) {
+  buf_append_u8(out, TAG_DBL);
+  buf_append_dbl(out, val);
+}
+static void out_err(Buffer* out, uint32_t code, const std::string& msg) {
+  buf_append_u8(out, TAG_ERR);
+  buf_append_u32(out, code);
+  buf_append_u32(out, (uint32_t)msg.size());
+  buf_append(out, (const uint8_t*)msg.data(), msg.size());
+}
+static void out_arr(Buffer* out, uint32_t n) {
+  buf_append_u8(out, TAG_ARR);
+  buf_append_u32(out, n);
+}
+
 static struct {
   HMap db;
 } g_data;
@@ -144,17 +200,13 @@ static void do_get(std::vector<std::string>& cmd, struct Buffer& out) {
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
 
-  uint32_t status = RES_OK;
   HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node) {
-    status = RES_NX;  // Not eXists
-    buf_append(&out, (const uint8_t*)&status, 4);
-    return;
+    return out_nil(&out);
   }
 
   const std::string& val = container_of(node, Entry, node)->val;
-  buf_append(&out, (const uint8_t*)&status, 4);
-  buf_append(&out, (const uint8_t*)val.data(), val.size());
+  return out_str(&out, val.data(), val.size());
 }
 
 static void do_set(std::vector<std::string>& cmd, struct Buffer& out) {
@@ -172,9 +224,7 @@ static void do_set(std::vector<std::string>& cmd, struct Buffer& out) {
     ent->val.swap(cmd[2]);
     hm_insert(&g_data.db, &ent->node);
   }
-
-  uint32_t status = RES_OK;
-  buf_append(&out, (const uint8_t*)&status, 4);
+  return out_nil(&out);
 }
 
 static void do_del(std::vector<std::string>& cmd, struct Buffer& out) {
@@ -183,17 +233,25 @@ static void do_del(std::vector<std::string>& cmd, struct Buffer& out) {
   key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
 
   HNode* node = hm_delete(&g_data.db, &key.node, &entry_eq);
-  if (node) {  
+  if (node) {
     delete container_of(node, Entry, node);
   }
 
-  uint32_t status = RES_OK;
-  buf_append(&out, (const uint8_t*)&status, 4);
+  return out_int(&out, node ? 1 : 0);
 }
 
-// +--------+---------+
-// | status | data... |
-// +--------+---------+
+static bool cb_keys(HNode* node, void* arg) {
+  Buffer* out = (Buffer*)arg;
+  const std::string& key = container_of(node, Entry, node)->key;
+  out_str(out, key.data(), key.size());
+  return true;
+}
+
+static void do_keys(std::vector<std::string>& cmd, Buffer& out) {
+  out_arr(&out, (uint32_t)hm_size(&g_data.db));
+  hm_foreach(&g_data.db, &cb_keys, (void*)&out);
+}
+
 static void do_request(std::vector<std::string>& cmd, struct Buffer& out) {
   // remember where the msg starts to leave room for the length header
   size_t header_idx = buf_size(&out);
@@ -209,14 +267,15 @@ static void do_request(std::vector<std::string>& cmd, struct Buffer& out) {
     do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del") {
     do_del(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "keys") {
+    do_keys(cmd, out);
   } else {
-    // Unrecognized command
-    uint32_t status = RES_ERR;
-    buf_append(&out, (const uint8_t*)&status, 4);
+    out_err(&out, ERR_UNKNOWN, "unknown command.");
   }
 
   // size is current - initial - k_header_size
-  uint32_t payload_size = (uint32_t)(buf_size(&out) - header_idx - k_header_size);
+  uint32_t payload_size =
+      (uint32_t)(buf_size(&out) - header_idx - k_header_size);
 
   // patch into placeholder
   memcpy(out.data_begin + header_idx, &payload_size, k_header_size);
@@ -254,7 +313,8 @@ static bool try_one_request(Conn* conn) {
 }
 
 static void handle_write(Conn* conn) {
-  ssize_t rv = write(conn->fd, conn->outgoing.data_begin, buf_size(&conn->outgoing));
+  ssize_t rv =
+      write(conn->fd, conn->outgoing.data_begin, buf_size(&conn->outgoing));
   if (rv < 0 && errno == EAGAIN) {
     return;  // not ready
   }
