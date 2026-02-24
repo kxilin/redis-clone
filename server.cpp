@@ -8,11 +8,13 @@
 #include <unistd.h>
 
 #include <cstdint>
-#include <map>
 #include <string>
 #include <vector>
 
+#include "hashtable.h"
 #include "utils.h"
+
+#define container_of(ptr, T, member) ((T*)((char*)ptr - offsetof(T, member)))
 
 constexpr size_t k_max_args = 200 * 1000;
 
@@ -23,8 +25,8 @@ struct Conn {
   bool want_write = false;
   bool want_close = false;
   // buffered input and output
-  Buffer incoming;
-  Buffer outgoing;
+  struct Buffer incoming;
+  struct Buffer outgoing;
 };
 
 enum {
@@ -52,6 +54,10 @@ static Conn* handle_accept(int fd) {
   Conn* conn = new Conn();
   conn->fd = connfd;
   conn->want_read = true;  // read the first request
+  
+  buf_init(&conn->incoming, 16 * 1024);
+  buf_init(&conn->outgoing, 16 * 1024);
+  
   return conn;
 }
 
@@ -108,67 +114,132 @@ static int32_t parse_req(const uint8_t* data, size_t size,
   return 0;
 }
 
-static std::map<std::string, std::string> g_data;
+static struct {
+  HMap db;
+} g_data;
+
+struct Entry {
+  struct HNode node;
+  std::string key;
+  std::string val;
+};
+
+static bool entry_eq(HNode* lhs, HNode* rhs) {
+  struct Entry* le = container_of(lhs, struct Entry, node);
+  struct Entry* re = container_of(rhs, struct Entry, node);
+  return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t* data, size_t len) {
+  uint32_t h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++) {
+    h = (h + data[i]) * 0x01000193;
+  }
+  return h;
+}
+
+static void do_get(std::vector<std::string>& cmd, struct Buffer& out) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+  uint32_t status = RES_OK;
+  HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    status = RES_NX;  // Not eXists
+    buf_append(&out, (const uint8_t*)&status, 4);
+    return;
+  }
+
+  const std::string& val = container_of(node, Entry, node)->val;
+  buf_append(&out, (const uint8_t*)&status, 4);
+  buf_append(&out, (const uint8_t*)val.data(), val.size());
+}
+
+static void do_set(std::vector<std::string>& cmd, struct Buffer& out) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+  HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    container_of(node, Entry, node)->val.swap(cmd[2]);
+  } else {
+    Entry* ent = new Entry();
+    ent->key.swap(key.key);
+    ent->node.hcode = key.node.hcode;
+    ent->val.swap(cmd[2]);
+    hm_insert(&g_data.db, &ent->node);
+  }
+
+  uint32_t status = RES_OK;
+  buf_append(&out, (const uint8_t*)&status, 4);
+}
+
+static void do_del(std::vector<std::string>& cmd, struct Buffer& out) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+  HNode* node = hm_delete(&g_data.db, &key.node, &entry_eq);
+  if (node) {  
+    delete container_of(node, Entry, node);
+  }
+
+  uint32_t status = RES_OK;
+  buf_append(&out, (const uint8_t*)&status, 4);
+}
 
 // +--------+---------+
 // | status | data... |
 // +--------+---------+
-static void do_request(std::vector<std::string>& cmd, Buffer& out) {
+static void do_request(std::vector<std::string>& cmd, struct Buffer& out) {
   // remember where the msg starts to leave room for the length header
-  size_t header_idx = out.size();
+  size_t header_idx = buf_size(&out);
 
   // append placeholder
   uint32_t placeholder = 0;
-  out.append((const uint8_t*)&placeholder, k_header_size);
+  buf_append(&out, (const uint8_t*)&placeholder, k_header_size);
 
-  uint32_t status = RES_OK;
-
+  // Route the command
   if (cmd.size() == 2 && cmd[0] == "get") {
-    auto it = g_data.find(cmd[1]);
-    if (it == g_data.end()) {
-      status = RES_NX;  // Not eXists
-      out.append((const uint8_t*)&status, 4);
-    } else {
-      const std::string& val = it->second;
-      out.append((const uint8_t*)&status, 4);
-      out.append((const uint8_t*)val.data(), val.size());
-    }
+    do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set") {
-    g_data[cmd[1]].swap(cmd[2]);
-    out.append((const uint8_t*)&status, 4);
+    do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del") {
-    g_data.erase(cmd[1]);
-    out.append((const uint8_t*)&status, 4);
+    do_del(cmd, out);
   } else {
-    status = RES_ERR;  // unrecognized command
-    out.append((const uint8_t*)&status, 4);
+    // Unrecognized command
+    uint32_t status = RES_ERR;
+    buf_append(&out, (const uint8_t*)&status, 4);
   }
 
   // size is current - initial - k_header_size
-  uint32_t payload_size = (uint32_t)(out.size() - header_idx - k_header_size);
+  uint32_t payload_size = (uint32_t)(buf_size(&out) - header_idx - k_header_size);
 
   // patch into placeholder
-  memcpy(out.data() + header_idx, &payload_size, k_header_size);
+  memcpy(out.data_begin + header_idx, &payload_size, k_header_size);
 }
 
 static bool try_one_request(Conn* conn) {
   // 3. try to parse the buffer
   // protocol message header
-  if (conn->incoming.size() < k_header_size) {
+  if (buf_size(&conn->incoming) < k_header_size) {
     return false;  // continue to want read
   }
   uint32_t len = 0;
-  memcpy(&len, conn->incoming.data(), k_header_size);
+  memcpy(&len, conn->incoming.data_begin, k_header_size);
   if (len > k_max_msg) {
     conn->want_close = true;  // protocol error
     return false;
   }
   // protocol message body
-  if (k_header_size + len > conn->incoming.size()) {
+  if (k_header_size + len > buf_size(&conn->incoming)) {
     return false;  // continue to want read
   }
 
-  const uint8_t* request = conn->incoming.data() + k_header_size;
+  const uint8_t* request = conn->incoming.data_begin + k_header_size;
 
   std::vector<std::string> cmd;
   if (parse_req(request, len, cmd) < 0) {
@@ -178,12 +249,12 @@ static bool try_one_request(Conn* conn) {
 
   do_request(cmd, conn->outgoing);
 
-  conn->incoming.consume(k_header_size + len);
+  buf_consume(&conn->incoming, k_header_size + len);
   return true;
 }
 
 static void handle_write(Conn* conn) {
-  ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+  ssize_t rv = write(conn->fd, conn->outgoing.data_begin, buf_size(&conn->outgoing));
   if (rv < 0 && errno == EAGAIN) {
     return;  // not ready
   }
@@ -192,9 +263,9 @@ static void handle_write(Conn* conn) {
     return;  // error
   }
   // remove written data from outgoing
-  conn->outgoing.consume((size_t)rv);
+  buf_consume(&conn->outgoing, (size_t)rv);
   // update readiness intention
-  if (conn->outgoing.size() == 0) {
+  if (buf_size(&conn->outgoing) == 0) {
     conn->want_write = false;
     conn->want_read = true;
   }
@@ -209,7 +280,7 @@ static void handle_read(Conn* conn) {
     return;
   }
   // 2. add new data to conn incoming buffer
-  conn->incoming.append(buf, (size_t)bytes_read);
+  buf_append(&conn->incoming, buf, (size_t)bytes_read);
   // 3. try to parse the buffer
   // 4. process the parsed message
   // 5. remove the message from conn incoming buffer
@@ -217,14 +288,10 @@ static void handle_read(Conn* conn) {
   }
 
   // update readiness intention
-  if (conn->outgoing.size() > 0) {
+  if (buf_size(&conn->outgoing) > 0) {
     conn->want_read = false;
     conn->want_write = true;
-    // optimistic write: call handle_write immediately to
-    // save one poll() syscall. using 'return' enables
-    // tail-call optimization, allowing the CPU to jump
-    // directly back to the event loop, skipping the return
-    // 'hop' through this function
+    // optimistic write
     return handle_write(conn);
   }
 }
@@ -268,7 +335,7 @@ int main() {
     // the rest are connection sockets
     for (Conn* conn : fd2conn) {
       if (!conn) continue;
-      struct pollfd pfd = {conn->fd, POLLERR, 0};
+      struct pollfd pfd = {conn->fd, 0, 0};
       // poll() flags depending on application intent
       if (conn->want_read) {
         pfd.events |= POLLIN;
@@ -307,6 +374,8 @@ int main() {
       }
       if (ready & POLLERR || conn->want_close) {
         close(conn->fd);
+        buf_destroy(&conn->incoming);
+        buf_destroy(&conn->outgoing);
         fd2conn[conn->fd] = NULL;
         delete conn;
       }

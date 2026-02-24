@@ -1,5 +1,5 @@
 #include "utils.h"
-#include <cstdint>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -8,13 +8,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-void die(const char *msg) {
+#include <cstdint>
+
+void die(const char* msg) {
   int err = errno;
   fprintf(stderr, "[%d] %s\n", err, msg);
   abort();
 }
 
-void msg(const char *msg) { fprintf(stderr, "%s\n", msg); }
+void msg(const char* msg) { fprintf(stderr, "%s\n", msg); }
 
 void fd_set_nonblock(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -26,58 +28,68 @@ void fd_set_nonblock(int fd) {
   }
 }
 
-Buffer::Buffer(size_t capacity) {
+void buf_init(struct Buffer* buf, size_t capacity) {
   uint8_t* ptr = (uint8_t*)malloc(capacity);
   if (!ptr) die("malloc()");
-  buffer_begin = data_begin = data_end = ptr;
-  buffer_end = ptr + capacity;
+  buf->buffer_begin = buf->data_begin = buf->data_end = ptr;
+  buf->buffer_end = ptr + capacity;
 }
 
-Buffer::~Buffer() {
-  free(buffer_begin);
+void buf_destroy(struct Buffer* buf) {
+  free(buf->buffer_begin);
+  // Best practice: zero out pointers to prevent use-after-free
+  memset(buf, 0, sizeof(*buf));
 }
 
-void Buffer::clear() {
-  data_begin = data_end = buffer_begin;
+size_t buf_size(const struct Buffer* buf) {
+  return buf->data_end - buf->data_begin;
 }
 
-void Buffer::append(const uint8_t* data, size_t len) {
-  if (free_space() < len) {
-    size_t data_size = size();
+size_t buf_free_space(const struct Buffer* buf) {
+  return buf->buffer_end - buf->data_end;
+}
 
-    if (capacity() >= data_size + len) {
-      memmove(buffer_begin, data_begin, data_size);
-      data_begin = buffer_begin;
-      data_end = buffer_begin + data_size;
+void buf_append(struct Buffer* buf, const uint8_t* data, size_t len) {
+  if (buf_free_space(buf) < len) {
+    size_t data_size = buf_size(buf);
+    size_t capacity = buf->buffer_end - buf->buffer_begin;
+
+    if (capacity >= data_size + len) {
+      // Case 1: Just slide data back to the start to make room
+      memmove(buf->buffer_begin, buf->data_begin, data_size);
+      buf->data_begin = buf->buffer_begin;
+      buf->data_end = buf->buffer_begin + data_size;
     } else {
-      size_t new_capacity = capacity() * 2 + len;
-      uint8_t* new_ptr = (uint8_t*)realloc(buffer_begin, new_capacity);
+      // Case 2: Actually need more memory
+      size_t new_capacity = capacity * 2 + len;
+      uint8_t* new_ptr = (uint8_t*)realloc(buf->buffer_begin, new_capacity);
       if (!new_ptr) die("realloc()");
 
-      data_begin = new_ptr + (data_begin - buffer_begin);
-      data_end = new_ptr + (data_end - buffer_begin);
-      buffer_begin = new_ptr;
-      buffer_end = new_ptr + new_capacity;
+      // Re-adjust pointers relative to the new memory address
+      buf->data_begin = new_ptr + (buf->data_begin - buf->buffer_begin);
+      buf->data_end = new_ptr + (buf->data_end - buf->buffer_begin);
+      buf->buffer_begin = new_ptr;
+      buf->buffer_end = new_ptr + new_capacity;
     }
   }
 
-  memcpy(data_end, data, len);
-  data_end += len;
+  memcpy(buf->data_end, data, len);
+  buf->data_end += len;
 }
 
-void Buffer::consume(size_t len) {
-  data_begin += len;
-  if (data_begin == data_end) {
-    data_begin = data_end = buffer_begin;
+void buf_consume(struct Buffer* buf, size_t len) {
+  buf->data_begin += len;
+  // Optimization: if the buffer is empty, reset pointers to the start
+  if (buf->data_begin == buf->data_end) {
+    buf->data_begin = buf->data_end = buf->buffer_begin;
   }
 }
 
-int32_t read_all(int fd, uint8_t *buf, size_t n) {
+int32_t read_all(int fd, uint8_t* buf, size_t n) {
   while (n > 0) {
     ssize_t bytes_read = read(fd, buf, n);
     if (bytes_read <= 0) {
-      if (errno == EINTR)
-        continue; // interrupted by signal
+      if (errno == EINTR) continue;  // interrupted by signal
       return -1;  // EOF (== 0) before n bytes sent is an error
     }
     n -= bytes_read;
@@ -87,12 +99,11 @@ int32_t read_all(int fd, uint8_t *buf, size_t n) {
   return 0;
 }
 
-int32_t write_all(int fd, uint8_t *buf, size_t n) {
+int32_t write_all(int fd, uint8_t* buf, size_t n) {
   while (n > 0) {
     ssize_t bytes_written = write(fd, buf, n);
     if (bytes_written <= 0) {
-      if (errno == EINTR)
-        continue;
+      if (errno == EINTR) continue;
       return -1;
     };
     n -= bytes_written;

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "utils.h"
 
@@ -21,67 +22,86 @@ static int32_t send_req(int fd, std::vector<std::string>& cmd) {
     return -1;
   }
 
-  // send request
-  Buffer wbuf;
-  wbuf.append((const uint8_t*)&len, k_header_size);
-  uint32_t n = cmd.size();
-  wbuf.append((const uint8_t*)&n, k_header_size);
+  struct Buffer wbuf;
+  buf_init(&wbuf, 16 * 1024);
+
+  buf_append(&wbuf, (const uint8_t*)&len, k_header_size);
+
+  uint32_t n = (uint32_t)cmd.size();
+  buf_append(&wbuf, (const uint8_t*)&n, k_header_size);
+
   for (const std::string& s : cmd) {
     uint32_t p = (uint32_t)s.size();
-    wbuf.append((const uint8_t*)&p, k_header_size);
-    wbuf.append((const uint8_t*)s.data(), s.size());
+    buf_append(&wbuf, (const uint8_t*)&p, k_header_size);
+    buf_append(&wbuf, (const uint8_t*)s.data(), s.size());
   }
-  return write_all(fd, wbuf.data(), wbuf.size());
+
+  // Accessing the pointer directly via data_begin
+  int32_t err = write_all(fd, wbuf.data_begin, buf_size(&wbuf));
+
+  buf_destroy(&wbuf);
+  return err;
 }
 
 static int32_t read_res(int fd) {
-  // protocol message header
-  std::vector<uint8_t> rbuf;
-  rbuf.resize(k_header_size);
+  // Protocol message header
+  uint8_t header[k_header_size];
   errno = 0;
-  int32_t err = read_all(fd, rbuf.data(), k_header_size);
+  int32_t err = read_all(fd, header, k_header_size);
   if (err) {
     msg(errno == 0 ? "EOF" : "read() error");
     return err;
   }
 
   uint32_t len = 0;
-  memcpy(&len, rbuf.data(),
-         k_header_size);  // assume client and server same endianness
+  memcpy(&len, header, k_header_size);
   if (len > k_max_msg) {
     msg("too long");
     return -1;
   }
 
-  // protocol message body
-  rbuf.resize(k_header_size + len);
-  err = read_all(fd, rbuf.data() + k_header_size, len);
+  // Protocol message body
+  struct Buffer rbuf;
+  buf_init(&rbuf, len);
+
+  // Read the body into the buffer
+  // Note: read_all expects a raw pointer, so we pass rbuf.data_begin
+  err = read_all(fd, rbuf.data_begin, len);
   if (err) {
     msg("read() error");
+    buf_destroy(&rbuf);
     return err;
   }
 
-  // print the result
-  uint32_t rescode = 0;
+  // Update the buffer's end pointer since we filled it manually via read_all
+  rbuf.data_end = rbuf.data_begin + len;
+
+  // Print the result
   if (len < 4) {
     msg("bad response");
+    buf_destroy(&rbuf);
     return -1;
   }
-  memcpy(&rescode, &rbuf[4], 4);
-  printf("server says: [%u] %.*s\n", rescode, len - 4, &rbuf[8]);
+
+  uint32_t rescode = 0;
+  memcpy(&rescode, rbuf.data_begin, 4);
+  printf("server says: [%u] %.*s\n", rescode, (int)(len - 4),
+         rbuf.data_begin + 4);
+
+  buf_destroy(&rbuf);
   return 0;
 }
 
-int main(int argc, char** argv) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);  // get socket fd
+int main() {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) die("socket()");
 
-  struct sockaddr_in addr = {};  // address of server to connect to
+  struct sockaddr_in addr = {};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(1234);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (connect(fd, (const struct sockaddr*)&addr, sizeof(addr)) <
-      0) {  // connect to the ip:port address
+
+  if (connect(fd, (const struct sockaddr*)&addr, sizeof(addr)) < 0) {
     die("connect()");
   }
 
