@@ -206,7 +206,7 @@ static int32_t read_res(int fd) {
   return rv;
 }
 
-int main() {
+int main(int argc, char** argv) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) die("socket()");
 
@@ -219,32 +219,16 @@ int main() {
     die("connect");
   }
 
-  // --- PIPELINING TEST START ---
-  printf("--- Sending pipelined requests ---\n");
-
-  // 1. Prepare multiple commands
-  std::vector<std::vector<std::string>> pipeline = {{"set", "key1", "hello"},
-                                                    {"set", "key2", "world"},
-                                                    {"get", "key1"},
-                                                    {"get", "key2"},
-                                                    {"keys"}};
-
-  // 2. Send ALL requests without reading responses yet
-  for (const auto& cmd : pipeline) {
-    printf("Sending: %s...\n", cmd[0].c_str());
-    if (send_req(fd, cmd) != 0) {
-      die("send_req");
-    }
+  std::vector<std::string> cmd;
+  for (int i = 1; i < argc; i++) {
+    cmd.push_back(argv[i]);
   }
 
-  printf("\n--- All requests sent, now reading responses ---\n");
-
-  // 3. Read back all responses in order
-  for (size_t i = 0; i < pipeline.size(); ++i) {
-    printf("Response %zu: ", i + 1);
-    if (read_res(fd) < 0) {
-      break;
-    }
+  if (send_req(fd, cmd) != 0) {
+    die("send_req");
+  }
+  if (read_res(fd) < 0) {
+    die("read_res");
   }
 
   close(fd);
